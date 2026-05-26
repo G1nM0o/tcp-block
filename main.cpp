@@ -25,8 +25,8 @@ using namespace std;
 struct PseudoHdr {
     uint32_t sip;
     uint32_t dip;
-    uint8_t  zero;
-    uint8_t  proto;
+    uint8_t zero;
+    uint8_t proto;
     uint16_t len;
 };
 
@@ -56,18 +56,15 @@ uint16_t checksum(const void* data, size_t len)
     return htons(static_cast<uint16_t>(~sum));
 }
 
-uint16_t tcp_checksum(IpHdr* ip, TcpHdr* tcp, size_t tcp_len)
+uint16_t tcp_checksum(const IpHdr* ip, const TcpHdr* tcp, size_t tcp_len)
 {
     PseudoHdr ph{};
-
     ph.sip = ip->sip;
     ph.dip = ip->dip;
-    ph.zero = 0;
     ph.proto = IP_PROTO_TCP;
     ph.len = htons(static_cast<uint16_t>(tcp_len));
 
     vector<uint8_t> buf(sizeof(PseudoHdr) + tcp_len);
-
     memcpy(buf.data(), &ph, sizeof(PseudoHdr));
     memcpy(buf.data() + sizeof(PseudoHdr), tcp, tcp_len);
 
@@ -164,7 +161,6 @@ void send_backward_fin(Ctx* ctx, const IpHdr* org_ip, const TcpHdr* org_tcp, uin
     tcp->urp = 0;
 
     memcpy(payload, msg, msg_len);
-
     tcp->sum = tcp_checksum(ip, tcp, sizeof(TcpHdr) + msg_len);
 
     sockaddr_in addr{};
@@ -182,38 +178,26 @@ void on_packet(u_char* user, const pcap_pkthdr* h, const u_char* bytes)
         return;
 
     const EthHdr* eth = reinterpret_cast<const EthHdr*>(bytes);
-
     if (ntohs(eth->type) != ETH_TYPE_IP)
         return;
 
     const IpHdr* ip = reinterpret_cast<const IpHdr*>(bytes + sizeof(EthHdr));
-
-    uint8_t ip_version = ip->vhl >> 4;
     uint32_t ip_hlen = (ip->vhl & 0x0f) * 4;
 
-    if (ip_version != 4)
-        return;
-
-    if (ip->proto != IP_PROTO_TCP)
-        return;
-
-    uint16_t frag = ntohs(ip->off);
-    if ((frag & 0x2000) || (frag & 0x1fff))
+    if ((ip->vhl >> 4) != 4 || ip->proto != IP_PROTO_TCP)
         return;
 
     if (h->caplen < sizeof(EthHdr) + ip_hlen + sizeof(TcpHdr))
         return;
 
     const TcpHdr* tcp = reinterpret_cast<const TcpHdr*>(bytes + sizeof(EthHdr) + ip_hlen);
-
     uint32_t tcp_hlen = (tcp->off >> 4) * 4;
-    uint32_t ip_total_len = ntohs(ip->len);
+    uint32_t ip_len = ntohs(ip->len);
 
-    if (ip_total_len < ip_hlen + tcp_hlen)
+    if (ip_len < ip_hlen + tcp_hlen)
         return;
 
-    uint32_t tcp_data_size = ip_total_len - ip_hlen - tcp_hlen;
-
+    uint32_t tcp_data_size = ip_len - ip_hlen - tcp_hlen;
     if (tcp_data_size == 0)
         return;
 
@@ -221,23 +205,18 @@ void on_packet(u_char* user, const pcap_pkthdr* h, const u_char* bytes)
         return;
 
     const char* payload = reinterpret_cast<const char*>(bytes + sizeof(EthHdr) + ip_hlen + tcp_hlen);
-
     const char* payload_end = payload + tcp_data_size;
 
-    auto found = search(payload, payload_end, ctx->pattern.begin(), ctx->pattern.end());
-
-    if (found == payload_end)
+    if (search(payload, payload_end, ctx->pattern.begin(), ctx->pattern.end()) == payload_end)
         return;
 
-    send_forward_rst(ctx, eth, ip, tcp, tcp_data_size);
     send_backward_fin(ctx, ip, tcp, tcp_data_size);
+    send_forward_rst(ctx, eth, ip, tcp, tcp_data_size);
 
     char sip[16];
     char dip[16];
-
     inet_ntop(AF_INET, &ip->sip, sip, sizeof(sip));
     inet_ntop(AF_INET, &ip->dip, dip, sizeof(dip));
-
     printf("blocked %s:%u -> %s:%u\n", sip, ntohs(tcp->sport), dip, ntohs(tcp->dport));
 }
 
@@ -258,8 +237,12 @@ int main(int argc, char* argv[])
     get_my_mac(argv[1], ctx.my_mac);
 
     ctx.handle = pcap_open_live(argv[1], BUFSIZ, 1, 1, errbuf);
+    if (ctx.handle == nullptr)
+        return 1;
 
     ctx.raw_sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (ctx.raw_sock < 0)
+        return 1;
 
     int on = 1;
     setsockopt(ctx.raw_sock, IPPROTO_IP, IP_HDRINCL, &on, sizeof(on));
@@ -267,11 +250,15 @@ int main(int argc, char* argv[])
     bpf_program fp{};
     pcap_compile(ctx.handle, &fp, "tcp", 1, PCAP_NETMASK_UNKNOWN);
     pcap_setfilter(ctx.handle, &fp);
+    pcap_freecode(&fp);
 
     printf("tcp-block on %s\n", argv[1]);
     printf("pattern: %s\n", argv[2]);
 
     pcap_loop(ctx.handle, 0, on_packet, reinterpret_cast<u_char*>(&ctx));
+
+    close(ctx.raw_sock);
+    pcap_close(ctx.handle);
 
     return 0;
 }
